@@ -1,0 +1,17 @@
+{
+  "name": "terraforge-relay",
+  "version": "1.0.0",
+  "description": "TerraForge always-on WebSocket relay server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
