@@ -46,6 +46,7 @@ class Room {
     this.worldReady = false;
     this.worldSeed = this.seed;
     this.blockDiffs = []; // [bx, by, blockId, bx, by, blockId, ...]
+    this.chestData = {}; // key -> array of 20 slots (shared chest contents)
     this.templeX = 0;
     this.templeGuardianDefeated = false;
 
@@ -136,6 +137,7 @@ class Room {
       gameTime: this.gameTime,
       templeX: this.templeX,
       templeGuardianDefeated: this.templeGuardianDefeated,
+      chestData: this.chestData,
     }));
 
     // Send accumulated block diffs in chunks
@@ -204,6 +206,14 @@ class Room {
 
           // Relay to all other clients
           this.broadcast(data, clientId);
+
+          // If a chest block was destroyed, clean up its stored contents
+          if (data.blockId === 0) { // B.AIR
+            const chestKey = data.bx + ',' + data.by;
+            if (this.chestData[chestKey]) {
+              delete this.chestData[chestKey];
+            }
+          }
         }
         break;
 
@@ -223,6 +233,14 @@ class Room {
       case 'pvp_hit':
         // Relay PvP hits to all other clients
         this.broadcast(data, clientId);
+        break;
+
+      case 'chest_sync':
+        // Store chest contents server-side and relay to other players
+        if (data.key && data.slots) {
+          this.chestData[data.key] = data.slots;
+          this.broadcast(data, clientId);
+        }
         break;
 
       case 'request_world':
