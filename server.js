@@ -59,6 +59,8 @@ class Room {
     // Connected clients
     this.clients = new Map(); // clientId -> { ws, name, lastPos, skinData }
     this.hostClientId = null; // set when room creator joins
+    this.admins = new Set(); // clientIds with admin privileges
+    this.adminToken = crypto.randomBytes(16).toString('hex'); // secret token for website admin auth
 
     // Tick: advance game time (TerraForge runs at ~60fps, time increments 1/frame)
     this.tickInterval = setInterval(() => this.tick(), 1000);
@@ -258,9 +260,9 @@ class Room {
         break;
 
       case 'admin_cmd':
-        // Only the room host can issue admin commands
-        if (clientId !== this.hostClientId) {
-          client.ws.send(JSON.stringify({ type: 'chat', text: '[Server] You are not the host.' }));
+        // Only admins (including host) can issue admin commands
+        if (!this.admins.has(clientId)) {
+          client.ws.send(JSON.stringify({ type: 'chat', text: '[Server] You are not an admin.' }));
           break;
         }
         this.handleAdminCmd(clientId, data);
@@ -405,12 +407,33 @@ class Room {
       case 'list_players': {
         const players = [];
         for (const [id, c] of this.clients) {
+          if (c.isWebAdmin) continue; // don't list web admin connections as players
           const pos = c.lastPos ? `(${Math.floor(c.lastPos.x/8)}, ${Math.floor(c.lastPos.y/8)})` : '(?)';
-          players.push({ name: c.name, id: id, pos: pos, isHost: id === this.hostClientId });
+          players.push({ name: c.name, id: id, pos: pos, isHost: id === this.hostClientId, isAdmin: this.admins.has(id) });
         }
         hostClient.ws.send(JSON.stringify({
           type: 'admin_player_list', players: players
         }));
+        break;
+      }
+      case 'promote_admin': {
+        // Only the host can promote/demote
+        if (clientId !== this.hostClientId) { sendToHost('[Admin] Only the host can promote admins.'); break; }
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        this.admins.add(target.id);
+        target.client.ws.send(JSON.stringify({ type: 'admin_action', action: 'promoted' }));
+        this.broadcast({ type: 'chat', text: '[Server] ' + target.client.name + ' is now an admin.' });
+        break;
+      }
+      case 'demote_admin': {
+        if (clientId !== this.hostClientId) { sendToHost('[Admin] Only the host can demote admins.'); break; }
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        if (target.id === this.hostClientId) { sendToHost('[Admin] Cannot demote the host.'); break; }
+        this.admins.delete(target.id);
+        target.client.ws.send(JSON.stringify({ type: 'admin_action', action: 'demoted' }));
+        this.broadcast({ type: 'chat', text: '[Server] ' + target.client.name + ' is no longer an admin.' });
         break;
       }
       default:
@@ -435,6 +458,8 @@ class Room {
   }
 
   toJSON() {
+    let playerCount = 0;
+    for (const [, c] of this.clients) { if (!c.isWebAdmin) playerCount++; }
     return {
       code: this.code,
       name: this.name,
@@ -444,7 +469,7 @@ class Room {
       maxPlayers: this.maxPlayers,
       seed: this.seed,
       pvp: this.pvp,
-      players: this.clients.size,
+      players: playerCount,
       createdAt: this.createdAt,
       status: 'online',
     };
@@ -516,7 +541,9 @@ app.post('/api/rooms', (req, res) => {
     pvp: !!pvp,
   });
   rooms.set(code, room);
-  res.json(room.toJSON());
+  const resp = room.toJSON();
+  resp.adminToken = room.adminToken; // only returned at creation
+  res.json(resp);
 });
 
 // Delete a room
@@ -583,6 +610,7 @@ wss.on('connection', (ws, req) => {
       // Auto-join the creator
       currentRoom = room;
       room.hostClientId = clientId;
+      room.admins.add(clientId); // host is always admin
       room.addClient(clientId, ws, data.host || 'Host');
 
       ws.send(JSON.stringify({
@@ -600,6 +628,32 @@ wss.on('connection', (ws, req) => {
         list.push(room.toJSON());
       }
       ws.send(JSON.stringify({ type: 'room_list', rooms: list }));
+      return;
+    }
+
+    // Admin join — website admin panel connects with token auth
+    if (data.type === 'admin_join') {
+      const code = (data.code || '').toUpperCase();
+      const room = rooms.get(code);
+      if (!room) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
+        return;
+      }
+      if (data.token !== room.adminToken) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Invalid admin token' }));
+        return;
+      }
+      currentRoom = room;
+      room.admins.add(clientId);
+      // Store a lightweight admin-only "client" for message routing
+      room.clients.set(clientId, {
+        ws, name: '🛡 WebAdmin', lastPos: null, skinData: null, isWebAdmin: true,
+      });
+      ws.send(JSON.stringify({
+        type: 'admin_joined', code: room.code, clientId: clientId,
+        roomInfo: room.toJSON(),
+      }));
+      console.log(`[Room ${code}] Web admin connected`);
       return;
     }
 
