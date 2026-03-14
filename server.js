@@ -58,6 +58,7 @@ class Room {
 
     // Connected clients
     this.clients = new Map(); // clientId -> { ws, name, lastPos, skinData }
+    this.hostClientId = null; // set when room creator joins
 
     // Tick: advance game time (TerraForge runs at ~60fps, time increments 1/frame)
     this.tickInterval = setInterval(() => this.tick(), 1000);
@@ -256,6 +257,15 @@ class Room {
         }
         break;
 
+      case 'admin_cmd':
+        // Only the room host can issue admin commands
+        if (clientId !== this.hostClientId) {
+          client.ws.send(JSON.stringify({ type: 'chat', text: '[Server] You are not the host.' }));
+          break;
+        }
+        this.handleAdminCmd(clientId, data);
+        break;
+
       default:
         // Forward unknown message types to all other clients
         this.broadcast(data, clientId);
@@ -275,6 +285,136 @@ class Room {
   broadcastEntitySync() {
     if (this.entities.length > 0 && this.clients.size > 0) {
       this.broadcast({ type: 'entity_sync', entities: this.entities });
+    }
+  }
+
+  handleAdminCmd(hostId, data) {
+    const cmd = data.cmd;
+    const hostClient = this.clients.get(hostId);
+    if (!hostClient) return;
+
+    const sendToHost = (msg) => {
+      try { hostClient.ws.send(JSON.stringify({ type: 'chat', text: msg })); } catch(e) {}
+    };
+
+    // Find target client by name (case-insensitive)
+    const findClient = (name) => {
+      if (!name) return null;
+      const lower = name.toLowerCase();
+      for (const [id, c] of this.clients) {
+        if (c.name && c.name.toLowerCase() === lower) return { id, client: c };
+      }
+      return null;
+    };
+
+    switch (cmd) {
+      case 'tp_player': {
+        // Teleport a player to coordinates
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        target.client.ws.send(JSON.stringify({
+          type: 'admin_action', action: 'teleport', x: data.x, y: data.y
+        }));
+        this.broadcast({ type: 'chat', text: '[Admin] ' + target.client.name + ' was teleported.' });
+        break;
+      }
+      case 'tp_to_player': {
+        // Teleport one player to another
+        const src = findClient(data.target);
+        const dest = findClient(data.destination);
+        if (!src) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        if (!dest) { sendToHost('[Admin] Player "' + data.destination + '" not found.'); break; }
+        if (!dest.client.lastPos) { sendToHost('[Admin] Destination player has no position data.'); break; }
+        src.client.ws.send(JSON.stringify({
+          type: 'admin_action', action: 'teleport', x: dest.client.lastPos.x, y: dest.client.lastPos.y
+        }));
+        this.broadcast({ type: 'chat', text: '[Admin] ' + src.client.name + ' was teleported to ' + dest.client.name + '.' });
+        break;
+      }
+      case 'kill_player': {
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        target.client.ws.send(JSON.stringify({ type: 'admin_action', action: 'kill' }));
+        this.broadcast({ type: 'chat', text: '[Admin] ' + target.client.name + ' was slain by the server.' });
+        break;
+      }
+      case 'heal_player': {
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        target.client.ws.send(JSON.stringify({ type: 'admin_action', action: 'heal' }));
+        this.broadcast({ type: 'chat', text: '[Admin] ' + target.client.name + ' was healed.' });
+        break;
+      }
+      case 'give_item': {
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        target.client.ws.send(JSON.stringify({
+          type: 'admin_action', action: 'give', itemId: data.itemId, count: data.count || 1
+        }));
+        this.broadcast({ type: 'chat', text: '[Admin] Gave items to ' + target.client.name + '.' });
+        break;
+      }
+      case 'spawn_entity': {
+        // Relay spawn to entity authority (host client)
+        hostClient.ws.send(JSON.stringify({
+          type: 'admin_action', action: 'spawn_entity',
+          entityType: data.entityType, x: data.x, y: data.y, count: data.count || 1
+        }));
+        sendToHost('[Admin] Spawning ' + (data.count || 1) + 'x ' + data.entityType + '.');
+        break;
+      }
+      case 'kill_entities': {
+        // Kill all entities or specific type
+        this.entities = data.entityType
+          ? this.entities.filter(e => e.type !== data.entityType)
+          : [];
+        this.broadcast({ type: 'entity_sync', entities: this.entities });
+        this.broadcast({ type: 'chat', text: '[Admin] Cleared ' + (data.entityType || 'all') + ' entities.' });
+        break;
+      }
+      case 'kick_player': {
+        const target = findClient(data.target);
+        if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
+        if (target.id === hostId) { sendToHost('[Admin] You cannot kick yourself.'); break; }
+        target.client.ws.send(JSON.stringify({ type: 'admin_action', action: 'kicked', reason: data.reason || 'Kicked by host' }));
+        this.broadcast({ type: 'chat', text: '[Admin] ' + target.client.name + ' was kicked.' });
+        // Delay to let the message arrive, then close
+        setTimeout(() => { try { target.client.ws.close(1000, 'Kicked'); } catch(e) {} }, 200);
+        break;
+      }
+      case 'set_time': {
+        if (data.t !== undefined) {
+          this.gameTime = data.t;
+          this.broadcast({ type: 'time_sync', t: this.gameTime });
+          sendToHost('[Admin] Time set.');
+        }
+        break;
+      }
+      case 'set_pvp': {
+        this.pvp = !!data.enabled;
+        this.broadcast({ type: 'admin_action', action: 'set_pvp', enabled: this.pvp });
+        this.broadcast({ type: 'chat', text: '[Admin] PvP ' + (this.pvp ? 'enabled' : 'disabled') + ' server-wide.' });
+        break;
+      }
+      case 'broadcast_msg': {
+        if (data.text) {
+          this.broadcast({ type: 'chat', text: '[Server] ' + data.text });
+        }
+        break;
+      }
+      case 'list_players': {
+        const players = [];
+        for (const [id, c] of this.clients) {
+          const pos = c.lastPos ? `(${Math.floor(c.lastPos.x/8)}, ${Math.floor(c.lastPos.y/8)})` : '(?)';
+          players.push({ name: c.name, id: id, pos: pos, isHost: id === this.hostClientId });
+        }
+        hostClient.ws.send(JSON.stringify({
+          type: 'admin_player_list', players: players
+        }));
+        break;
+      }
+      default:
+        sendToHost('[Admin] Unknown command: ' + cmd);
     }
   }
 
@@ -442,6 +582,7 @@ wss.on('connection', (ws, req) => {
 
       // Auto-join the creator
       currentRoom = room;
+      room.hostClientId = clientId;
       room.addClient(clientId, ws, data.host || 'Host');
 
       ws.send(JSON.stringify({
