@@ -49,8 +49,10 @@ class Room {
     this.templeX = 0;
     this.templeGuardianDefeated = false;
 
-    // Game state
-    this.gameTime = 0;
+    // Game state — gameTime is a float where fractional part is time-of-day (0.0–1.0)
+    // dayLength=900 means one full day cycle = 900 real seconds
+    this.gameTime = 0.3; // start at ~7:12 AM, matching client default
+    this.dayLength = 900;
     this.entities = [];
 
     // Connected clients
@@ -67,8 +69,8 @@ class Room {
   }
 
   tick() {
-    // Advance game time (~60 ticks worth per real second)
-    this.gameTime += 60;
+    // Advance game time: 1 tick = 1 real second, full day = dayLength seconds
+    this.gameTime += 1 / this.dayLength;
   }
 
   addClient(clientId, ws, name) {
@@ -229,7 +231,11 @@ class Room {
         break;
 
       case 'time_sync':
-        // Ignore — server controls time
+        // Allow host (first client / entity authority) to set time via /time commands
+        if (data.t !== undefined) {
+          this.gameTime = data.t;
+          this.broadcast({ type: 'time_sync', t: this.gameTime });
+        }
         break;
 
       default:
