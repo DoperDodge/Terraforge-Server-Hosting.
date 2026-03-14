@@ -33,11 +33,11 @@ class Room {
     this.createdAt = Date.now();
 
     // World dimensions from TerraForge's WORLD_SIZES
-    const sizes = { small: [600, 1200], medium: [1200, 1200], large: [2400, 1200] };
+    const sizes = { small: [600, 1400], medium: [1200, 1400], large: [2400, 1400] };
     const [w, h] = sizes[this.worldSize] || sizes.small;
     this.worldW = w;
     this.worldH = h;
-    this.surfaceY = Math.floor(h * 0.08); // matches TerraForge's SURFACE_Y ratio
+    this.surfaceY = Math.floor(h * 0.12); // matches TerraForge's SURFACE_Y ratio
 
     // World state: we don't generate the world server-side.
     // Instead, the first client to connect becomes the "world source" —
