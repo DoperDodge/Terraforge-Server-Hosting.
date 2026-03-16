@@ -592,8 +592,7 @@ class Room {
         break;
       }
       case 'promote_admin': {
-        // Only the host can promote/demote
-        if (clientId !== this.hostClientId) { sendToHost('[Admin] Only the host can promote admins.'); break; }
+        // Any admin can promote others
         const target = findClient(data.target);
         if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
         this.admins.add(target.id);
@@ -602,7 +601,7 @@ class Room {
         break;
       }
       case 'demote_admin': {
-        if (clientId !== this.hostClientId) { sendToHost('[Admin] Only the host can demote admins.'); break; }
+        // Any admin can demote, but cannot demote the host
         const target = findClient(data.target);
         if (!target) { sendToHost('[Admin] Player "' + data.target + '" not found.'); break; }
         if (target.id === this.hostClientId) { sendToHost('[Admin] Cannot demote the host.'); break; }
