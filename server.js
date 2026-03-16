@@ -13,7 +13,7 @@ const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: 50 * 1024 * 1024 }); // 50MB for world uploads
 
 const PORT = process.env.PORT || 3000;
 
@@ -56,6 +56,14 @@ class Room {
     this.dayLength = 900;
     this.entities = [];
 
+    // Player data persistence — keyed by player name (case-insensitive)
+    // Stores: inventory, armorSlots, wingSlot, playerMana, playerMaxMana, playerGold,
+    //         hasDashShield, position, hp, maxHp, gameMode, selectedSlot, skin
+    this.playerData = new Map(); // lowercase name -> { ... }
+
+    // Full world upload support (when host loads a save file)
+    this.fullWorldData = null; // if set, this replaces seed-based world generation
+
     // Connected clients
     this.clients = new Map(); // clientId -> { ws, name, lastPos, skinData }
     this.hostClientId = null; // set when room creator joins
@@ -94,6 +102,20 @@ class Room {
     // Send world sync to the new client
     this.sendWorldSync(clientId);
 
+    // Check for saved player data (by name, case-insensitive)
+    const nameKey = (name || 'Player').toLowerCase();
+    const saved = this.playerData.get(nameKey);
+    if (saved) {
+      // Send stored player data back so client can restore inventory/stats
+      try {
+        ws.send(JSON.stringify({
+          type: 'restore_player_data',
+          data: saved,
+        }));
+      } catch (e) { /* ignore */ }
+      console.log(`[Room ${this.code}] Restored player data for "${name}"`);
+    }
+
     console.log(`[Room ${this.code}] ${name} joined (${this.clients.size}/${this.maxPlayers})`);
     return true;
   }
@@ -115,51 +137,124 @@ class Room {
 
     console.log(`[Room ${this.code}] ${client.name} left (${this.clients.size}/${this.maxPlayers})`);
 
-    // Auto-cleanup: destroy room if empty for 5 minutes
-    if (this.clients.size === 0) {
-      this._emptyTimer = setTimeout(() => {
-        if (this.clients.size === 0) {
-          this.destroy();
-        }
-      }, 5 * 60 * 1000);
-    }
+    // NOTE: We do NOT auto-destroy empty rooms.
+    // Rooms persist until manually closed by admin or server restart.
+    // Player data is retained so players can rejoin and get their items back.
   }
 
   sendWorldSync(clientId) {
     const client = this.clients.get(clientId);
     if (!client) return;
 
-    // Send the seed-based world sync (client generates terrain from seed)
-    client.ws.send(JSON.stringify({
-      type: 'world_sync',
-      worldSeed: this.worldSeed,
-      worldSizeKey: this.worldSize,
-      worldW: this.worldW,
-      worldH: this.worldH,
-      surfaceY: this.surfaceY,
-      gameTime: this.gameTime,
-      templeX: this.templeX,
-      templeGuardianDefeated: this.templeGuardianDefeated,
-      chestData: this.chestData,
-    }));
+    // If a full world was uploaded (from a save file), send that instead of seed
+    if (this.fullWorldData) {
+      client.ws.send(JSON.stringify({
+        type: 'world_sync',
+        worldSizeKey: this.fullWorldData.worldSizeKey || this.worldSize,
+        worldW: this.fullWorldData.worldW || this.worldW,
+        worldH: this.fullWorldData.worldH || this.worldH,
+        surfaceY: this.fullWorldData.surfaceY || this.surfaceY,
+        gameTime: this.gameTime,
+        templeX: this.fullWorldData.templeX || this.templeX,
+        templeGuardianDefeated: this.fullWorldData.templeGuardianDefeated || this.templeGuardianDefeated,
+        chestData: this.chestData,
+        worldSeed: this.fullWorldData.worldSeed || this.worldSeed,
+        fullWorld: true, // flag telling client this is a full world upload
+      }));
 
-    // Send accumulated block diffs in chunks
-    if (this.blockDiffs.length > 0) {
-      const CHUNK = 3000; // 1000 blocks per chunk (3 ints each)
-      for (let i = 0; i < this.blockDiffs.length; i += CHUNK) {
-        const chunk = this.blockDiffs.slice(i, i + CHUNK);
+      // Send the full world arrays in chunks
+      const worldRLE = this.fullWorldData.world;
+      const bgRLE = this.fullWorldData.bgWorld;
+      const wallRLE = this.fullWorldData.wallWorld;
+      const CHUNK = 50000;
+
+      // Send world data
+      if (worldRLE && worldRLE.length > 0) {
+        for (let i = 0; i < worldRLE.length; i += CHUNK) {
+          const chunk = worldRLE.slice(i, i + CHUNK);
+          client.ws.send(JSON.stringify({
+            type: 'full_world_chunk',
+            layer: 'world',
+            data: chunk,
+            done: i + CHUNK >= worldRLE.length,
+          }));
+        }
+      }
+      if (bgRLE && bgRLE.length > 0) {
+        for (let i = 0; i < bgRLE.length; i += CHUNK) {
+          const chunk = bgRLE.slice(i, i + CHUNK);
+          client.ws.send(JSON.stringify({
+            type: 'full_world_chunk',
+            layer: 'bgWorld',
+            data: chunk,
+            done: i + CHUNK >= bgRLE.length,
+          }));
+        }
+      }
+      if (wallRLE && wallRLE.length > 0) {
+        for (let i = 0; i < wallRLE.length; i += CHUNK) {
+          const chunk = wallRLE.slice(i, i + CHUNK);
+          client.ws.send(JSON.stringify({
+            type: 'full_world_chunk',
+            layer: 'wallWorld',
+            data: chunk,
+            done: i + CHUNK >= wallRLE.length,
+          }));
+        }
+      }
+
+      // Send block diffs accumulated on top of the loaded world
+      if (this.blockDiffs.length > 0) {
+        const DC = 3000;
+        for (let i = 0; i < this.blockDiffs.length; i += DC) {
+          const chunk = this.blockDiffs.slice(i, i + DC);
+          client.ws.send(JSON.stringify({
+            type: 'world_diffs',
+            diffs: chunk,
+            done: i + DC >= this.blockDiffs.length,
+          }));
+        }
+      } else {
         client.ws.send(JSON.stringify({
           type: 'world_diffs',
-          diffs: chunk,
-          done: i + CHUNK >= this.blockDiffs.length,
+          diffs: [],
+          done: true,
         }));
       }
+
     } else {
+      // Seed-based world sync (original behavior)
       client.ws.send(JSON.stringify({
-        type: 'world_diffs',
-        diffs: [],
-        done: true,
+        type: 'world_sync',
+        worldSeed: this.worldSeed,
+        worldSizeKey: this.worldSize,
+        worldW: this.worldW,
+        worldH: this.worldH,
+        surfaceY: this.surfaceY,
+        gameTime: this.gameTime,
+        templeX: this.templeX,
+        templeGuardianDefeated: this.templeGuardianDefeated,
+        chestData: this.chestData,
       }));
+
+      // Send accumulated block diffs in chunks
+      if (this.blockDiffs.length > 0) {
+        const CHUNK = 3000; // 1000 blocks per chunk (3 ints each)
+        for (let i = 0; i < this.blockDiffs.length; i += CHUNK) {
+          const chunk = this.blockDiffs.slice(i, i + CHUNK);
+          client.ws.send(JSON.stringify({
+            type: 'world_diffs',
+            diffs: chunk,
+            done: i + CHUNK >= this.blockDiffs.length,
+          }));
+        }
+      } else {
+        client.ws.send(JSON.stringify({
+          type: 'world_diffs',
+          diffs: [],
+          done: true,
+        }));
+      }
     }
 
     // Send current entity state
@@ -243,6 +338,46 @@ class Room {
         if (data.key && data.slots) {
           this.chestData[data.key] = data.slots;
           this.broadcast(data, clientId);
+        }
+        break;
+
+      case 'player_data_sync':
+        // Client sends their full player data for persistence
+        // Keyed by player name (case-insensitive)
+        if (data.playerData && client.name) {
+          const nameKey = client.name.toLowerCase();
+          this.playerData.set(nameKey, data.playerData);
+          // Confirm save
+          try {
+            client.ws.send(JSON.stringify({ type: 'player_data_saved' }));
+          } catch (e) { /* ignore */ }
+        }
+        break;
+
+      case 'world_upload':
+        // Host uploads a full world (from a save file) to replace seed-based generation
+        // Only admins/host can do this
+        if (!this.admins.has(clientId)) {
+          client.ws.send(JSON.stringify({ type: 'chat', text: '[Server] Only admins can upload worlds.' }));
+          break;
+        }
+        if (data.worldData) {
+          this.fullWorldData = data.worldData;
+          // Update room dimensions from the uploaded world
+          if (data.worldData.worldW) this.worldW = data.worldData.worldW;
+          if (data.worldData.worldH) this.worldH = data.worldData.worldH;
+          if (data.worldData.surfaceY) this.surfaceY = data.worldData.surfaceY;
+          if (data.worldData.worldSeed) this.worldSeed = data.worldData.worldSeed;
+          if (data.worldData.worldSizeKey) this.worldSize = data.worldData.worldSizeKey;
+          if (data.worldData.templeX !== undefined) this.templeX = data.worldData.templeX;
+          if (data.worldData.templeGuardianDefeated) this.templeGuardianDefeated = data.worldData.templeGuardianDefeated;
+          if (data.worldData.chestData) this.chestData = data.worldData.chestData;
+          if (data.worldData.gameTime) this.gameTime = data.worldData.gameTime;
+          // Reset block diffs since the full world is now the baseline
+          this.blockDiffs = [];
+          this.broadcast({ type: 'chat', text: '[Server] World loaded from save file!' });
+          client.ws.send(JSON.stringify({ type: 'world_uploaded' }));
+          console.log(`[Room ${this.code}] Full world uploaded by ${client.name}`);
         }
         break;
 
@@ -404,6 +539,46 @@ class Room {
         }
         break;
       }
+      case 'save_world': {
+        // Request all connected clients to send their player data,
+        // then tell the requesting admin to trigger a client-side save download
+        // First, broadcast a save request to all clients
+        this.broadcast({ type: 'admin_action', action: 'save_player_data' });
+        // Tell the admin client to initiate a world save download after a short delay
+        // (to let player data arrive first)
+        setTimeout(() => {
+          const adminClient = this.clients.get(hostId);
+          if (adminClient) {
+            adminClient.ws.send(JSON.stringify({
+              type: 'admin_action',
+              action: 'download_world_save',
+              roomData: {
+                seed: this.worldSeed,
+                worldSize: this.worldSize,
+                worldW: this.worldW,
+                worldH: this.worldH,
+                surfaceY: this.surfaceY,
+                gameTime: this.gameTime,
+                chestData: this.chestData,
+                blockDiffs: this.blockDiffs,
+                templeX: this.templeX,
+                templeGuardianDefeated: this.templeGuardianDefeated,
+                hasFullWorld: !!this.fullWorldData,
+                fullWorldData: this.fullWorldData || null,
+                playerDataEntries: Array.from(this.playerData.entries()),
+              }
+            }));
+          }
+        }, 500);
+        sendToHost('[Admin] Saving world and player data...');
+        break;
+      }
+      case 'force_save_players': {
+        // Force all connected players to send their data to server
+        this.broadcast({ type: 'admin_action', action: 'save_player_data' });
+        sendToHost('[Admin] Requested all players to save their data.');
+        break;
+      }
       case 'list_players': {
         const players = [];
         for (const [id, c] of this.clients) {
@@ -445,7 +620,6 @@ class Room {
     clearInterval(this.tickInterval);
     clearInterval(this.entitySyncInterval);
     clearInterval(this.timeSyncInterval);
-    if (this._emptyTimer) clearTimeout(this._emptyTimer);
 
     // Disconnect all clients
     for (const [id, client] of this.clients) {
@@ -470,7 +644,9 @@ class Room {
       seed: this.seed,
       pvp: this.pvp,
       players: playerCount,
+      savedPlayers: this.playerData.size,
       createdAt: this.createdAt,
+      uptimeMinutes: Math.floor((Date.now() - this.createdAt) / 60000),
       status: 'online',
     };
   }
@@ -684,19 +860,21 @@ wss.on('connection', (ws, req) => {
 });
 
 // ─── Periodic cleanup of empty rooms ───────────────────────────────
+// Rooms are NOT auto-destroyed based on time.
+// They persist until manually closed by an admin or server restart.
+// This interval only logs stats for monitoring.
 setInterval(() => {
   const now = Date.now();
+  let activeRooms = 0;
+  let totalPlayers = 0;
   for (const [code, room] of rooms) {
-    // Auto-destroy rooms empty for over 30 minutes
-    if (room.clients.size === 0 && now - room.createdAt > 30 * 60 * 1000) {
-      room.destroy();
-    }
-    // Auto-destroy rooms older than 24 hours
-    if (now - room.createdAt > 24 * 60 * 60 * 1000) {
-      room.destroy();
-    }
+    activeRooms++;
+    totalPlayers += room.clients.size;
   }
-}, 60 * 1000);
+  if (activeRooms > 0) {
+    console.log(`[Stats] ${activeRooms} room(s), ${totalPlayers} player(s) connected`);
+  }
+}, 5 * 60 * 1000); // Log every 5 minutes
 
 // ─── Start ─────────────────────────────────────────────────────────
 server.listen(PORT, () => {
